@@ -1,0 +1,1730 @@
+ ;*****************************************************************************
+ ; Universidad del Valle de Guatemala
+ ; IE2023: Programacion de Microcontroladores
+ ; Autor: Pablo Garcia
+ ; Proyecto: Reloj Digital
+ ; Archivo: RelojDigital.asm (main)
+ ; Hardware: ATMEGA328P
+ ; Created: 05/03/2024
+ ;*****************************************************************************
+ .include "M328PDEF.inc"
+
+ .def Steps1ms = R0
+ .def Steps100ms = R1
+ .def Steps500ms = R2
+
+ .equ DisplayHour = 0
+ .equ DisplayFecha = 1
+ .equ DisplayAlarm = 2
+ .equ ModifyHour = 3
+ .equ ModifyFecha = 4
+ .equ ModifyAlarm = 5
+
+ .equ ButtonC = 0
+ .equ ButtonL = 1
+ .equ ButtonA = 2
+ .equ COM0 = 0
+ .equ COM1 = 1
+ .equ COM2 = 2
+ .equ COM3 = 3
+ .equ COM4 = 4
+ .equ COM5 = 5
+ .equ COM6 = 6
+
+ .equ S0 = 0x00
+ .equ S1 = 0x01
+ .equ S2 = 0x02
+ .equ S3 = 0x03
+ .equ S4 = 0x04
+ .equ S5 = 0x05
+ .equ S6 = 0x06
+ .equ S7 = 0x07
+ .equ S8 = 0x08
+ .equ S9 = 0x09
+ .equ S10 = 0x0A
+ .equ S11 = 0x0B
+ .equ S12 = 0x0C
+ .equ S13 = 0x0D
+ .equ S14 = 0x0E
+ .equ S15 = 0x0F
+
+ .equ Time_SecondsU = 0x0100
+ .equ Time_SecondsT = 0x0101
+ .equ Time_MinutesU = 0x0102
+ .equ Time_MinutesT = 0x0103
+ .equ Time_HoursU = 0x0104
+ .equ Time_HoursT = 0x0105
+ .equ Time_DaysU = 0x0106
+ .equ Time_DaysT = 0x0107
+ .equ Time_MonthsU = 0x0108
+ .equ Time_MonthsT = 0x0109
+
+ .equ NextState = 0x010A
+ .equ ActualState = 0x010B
+
+ .equ PrevPins = 0x010C
+ .equ NowPins = 0x010D
+
+ .equ Modules = 0x010E
+ .equ UpdateTimeFlag = 0x010F
+
+ .equ PrevCOMs = 0x0110
+ .equ NowCOMs = 0x0111
+
+ .equ Alarm_MinutesU = 0x0112
+ .equ Alarm_MinutesT = 0x0113
+ .equ Alarm_HoursU = 0x0114
+ .equ Alarm_HoursT = 0x0115
+
+ .equ SetAlarm = 0x0116
+ .equ SetAlarm_Mm = 0
+ .equ SetAlarm_Hh = 1
+ .equ IncAlarmFlag = 0x0117
+ .equ IncAlarmFirst = 0x0118
+ .equ IncAlarmLongDelay = 0x0119
+ .equ IncAlarmShortDelay = 0x011A
+
+ .equ SetTimeDate = 0x011B
+ .equ SetTime_Ss = 0
+ .equ SetTime_Mm = 1
+ .equ SetTime_Hh = 2
+ .equ SetDate_Mm = 3
+ .equ SetDate_Dd = 4
+ .equ IncTimeFlag = 0x011C
+ .equ IncTimeFirst = 0x011D
+ .equ IncTimeLongDelay = 0x011E
+ .equ IncTimeShortDelay = 0x011F
+
+ .equ AlarmDoneFlag = 0x0120
+ .equ AlarmEnableFlag = 0x0121
+ .equ VerifyAlarmFlag = 0x0122
+
+ .cseg
+ .org 0x0000	JMP		STACK
+ .org 0x0006	JMP		PINCHANGE_INT0
+ .org 0x0020	JMP		TIMER0_OVF
+
+ ;*****************************************************************************
+ STACK:
+ 	LDI		R16, LOW(RAMEND)
+	OUT		SPL, R16
+	LDI		R16, HIGH(RAMEND)
+	OUT		SPH, R16
+
+ ;*****************************************************************************
+ SETUP:
+ ; INTERRUPTIONS
+	SEI
+
+ ; CLOCK
+	LDI		R16, (1<<CLKPCE)
+	STS		CLKPR, R16			// Enable changes of the CLKPS bits
+	LDI		R16, 0x04
+	STS		CLKPR, R16			// Preescaler divider: 16. fclk = 1 MHz
+
+ ; TIMER0
+	LDI		R16, (1<<TOIE0)
+	STS		TIMSK0, R16			// Overflow	interrupt enable
+	LDI		R16, (0<<WGM01)|(0<<WGM00)
+	OUT		TCCR0A, R16			// Normal mode operation
+	LDI		R16, (1<<CS01)
+	OUT		TCCR0B, R16			// Preescaler: 8
+	LDI		R16, 134
+	OUT		TCNT0, R16			// Restart Timer0: count 1 ms
+
+ ; INPUTS
+ ; C(MODE): PB0, L(LIGHT): PB1, A(START): PB2
+	LDI		R16, (1<<PCIE0)
+	STS		PCICR, R16			// Pin change interrupt enable 0
+	LDI		R16, (1<<PCINT0)|(1<<PCINT1)|(1<<PCINT2)
+	STS		PCMSK0, R16			// Pin change enable mask
+	NOP
+
+ ; OUTPUTS
+ ; DP2: PB3, ALARM: PB4, COM6: PB5
+ 	LDI		R16, (0<<TXEN0)|(0<<RXEN0)
+	STS		UCSR0B, R16			// Disable RX and TX serial function
+	LDI		R16, 0x38
+	OUT		DDRB, R16			// Only pins [PB2,PB1,PB0] as inputs
+	LDI		R16, 0x00
+	OUT		PORTB, R16			// Clear PORTB pins
+	LDI		R16, (1<<PB0)|(1<<PB1)|(1<<PB2)
+	OUT		PORTB, R16			// Only pins [PB2,PB1,PB0] with pull-up
+	IN		R16, PINB
+	STS		NowPins, R16		// Save previous state of pins
+	NOP
+
+ ; Display: [a,b,c,d,e,f,g] : [PD0,PD1,PD2,PD3,PD4,PD5,PD6]
+	LDI		R16, 0xFF
+	OUT		DDRD, R16
+	LDI		R16, 0x00
+	OUT		PORTD, R16
+	NOP
+
+ ; [COM0,COM1,COM2,COM3,COM4,COM5] : [PC0,PC1,PC2,PC3,PC4,PC5]
+	LDI		R16, 0x3F
+	OUT		DDRC, R16
+	LDI		R16, 0x00
+	OUT		PORTD, R16
+	LDI		R16, 0x01
+	STS		NowCOMs, R16
+	NOP
+
+ ; INDIRECT DIRECTIONS
+ TABLA7SEG: .DB	0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F, 0x76, 0x71, 0x77, 0x00
+ 	LDI		ZL, LOW(TABLA7SEG<<1)	// Obtain initial direction of table (1/2)
+	LDI		ZH, HIGH(TABLA7SEG<<1)  // Obtain initial direction of table (2/2)
+
+ ; Setting time: 13/03 23:19:27
+	LDI		R16, 3
+	STS		Time_DaysU, R16
+	LDI		R16, 1
+	STS		Time_DaysT, R16
+	LDI		R16, 3
+	STS		Time_MonthsU, R16
+	LDI		R16, 0
+	STS		Time_MonthsT, R16
+	LDI		R16, 7
+	STS		Time_SecondsU, R16
+	LDI		R16, 2
+	STS		Time_SecondsT, R16
+	LDI		R16, 9
+	STS		Time_MinutesU, R16
+	LDI		R16, 1
+	STS		Time_MinutesT, R16
+	LDI		R16, 3
+	STS		Time_HoursU, R16
+	LDI		R16, 2
+	STS		Time_HoursT, R16
+	
+ ; Setting alarm: 14:59
+	LDI		R16, 9
+	STS		Alarm_MinutesU, R16
+	LDI		R16, 5
+	STS		Alarm_MinutesT, R16
+	LDI		R16, 4
+	STS		Alarm_HoursU, R16
+	LDI		R16, 1
+	STS		Alarm_HoursT, R16
+ 
+ ; Initial conditions
+	LDI		R16, 0x01
+	STS		SetAlarm, R16
+	STS		SetTimeDate, R16
+	LDI		R16, S8
+	STS		ActualState, R16
+
+ ;*****************************************************************************
+ LOOP:
+	LDS		R18, UpdateTimeFlag
+	CLR		R19
+	CPSE	R18, R19
+	RCALL	UpdateTime
+
+	LDS		R18, VerifyAlarmFlag
+	CLR		R19
+	CPSE	R18, R19
+	RCALL	VerifyAlarm
+
+	LDS		R18, AlarmDoneFlag
+	CLR		R19
+	CPSE	R18, R19
+	RCALL	AlarmDone
+
+	LDS		R18, IncAlarmFlag
+	CLR		R19
+	CPSE	R18, R19
+	RCALL	IncrementAlarm
+
+	LDS		R18, IncTimeFlag
+	CLR		R19
+	CPSE	R18, R19
+	RCALL	IncrementTime
+	
+	LDS		R18, PrevPins
+	LDS		R19, NowPins
+	CPSE	R18, R19
+	RCALL	NextStateLogic
+
+	LDS		R18, ActualState
+	LDS		R19, NextState
+ 	CPSE	R18, R19
+	RCALL	OutputLogic
+
+	LDS		R18, Modules
+
+	SBRC	R18, DisplayHour
+	RJMP	DisplayTime_HhMmSs
+
+	SBRC	R18, DisplayFecha
+	RJMP	DisplayDate_DdMm
+
+	SBRC	R18, DisplayAlarm
+	RJMP	DisplayAlarm_HhMm
+
+	SBRC	R18, ModifyHour
+	RJMP	ModifyTime_HhMmSs
+
+	SBRC	R18, ModifyFecha
+	RJMP	ModifyDate_DdMm
+
+	SBRC	R18, ModifyAlarm
+	RJMP	ModifyAlarm_HhMm
+
+	RJMP	LOOP
+
+ ;*****************************************************************************
+ DisplayTime_HhMmSs:
+	// Time COMs: [X, H, h, M, m, S, s, "H"]
+	LDI		R18, 0xFF				// COMs: 0b1111_1111
+	OUT		GPIOR0, R18
+	LDS		R18, NowCOMs
+	LDS		R19, PrevCOMs
+	CP		R18, R19
+	BREQ	NoDisplayTime_HhMmSs
+	STS		PrevCOMs, R18
+	SBRC	R18, COM0
+	LDI		R19, 10
+	SBRC	R18, COM1
+	LDS		R19, Time_SecondsU
+	SBRC	R18, COM2
+	LDS		R19, Time_SecondsT
+	SBRC	R18, COM3
+	LDS		R19, Time_MinutesU
+	SBRC	R18, COM4
+	LDS		R19, Time_MinutesT
+	SBRC	R18, COM5
+	LDS		R19, Time_HoursU
+	SBRC	R18, COM6
+	LDS		R19, Time_HoursT
+	OUT		GPIOR1, R19
+	CALL	MultiplexerBCD
+	RJMP	LOOP
+	NoDisplayTime_HhMmSs:
+	RJMP	LOOP
+
+ ;*****************************************************************************
+ ModifyTime_HhMmSs:
+	// Time COMs: [X, H, h, M, m, S, s, "H"]
+	LDI		R18, 0xFF				// COMs: 0b1111_1111
+	OUT		GPIOR0, R18
+	LDS		R18, NowCOMs
+	LDS		R19, PrevCOMs
+	CP		R18, R19
+	BREQ	NoModifyTime_HhMmSs
+	STS		PrevCOMs, R18
+	SBRC	R18, COM0
+	LDI		R19, 10
+	SBRC	R18, COM1
+	LDS		R19, Time_SecondsU
+	SBRC	R18, COM2
+	LDS		R19, Time_SecondsT
+	SBRC	R18, COM3
+	LDS		R19, Time_MinutesU
+	SBRC	R18, COM4
+	LDS		R19, Time_MinutesT
+	SBRC	R18, COM5
+	LDS		R19, Time_HoursU
+	SBRC	R18, COM6
+	LDS		R19, Time_HoursT
+	OUT		GPIOR1, R19
+
+	LDS		R18, IncTimeFlag
+	CPI		R18, 0
+	BRNE	NoBlinkTime
+
+	SBIC	PORTB, PB3
+	RCALL	BlinkTimeHigh
+	SBIS	PORTB, PB3
+	RCALL	BlinkTimeLow
+
+	NoBlinkTime:
+	CALL	MultiplexerBCD
+	RJMP	LOOP
+	NoModifyTime_HhMmSs:
+	RJMP	LOOP
+
+ BlinkTimeHigh:
+	// Time COMs: 0[X, H, h, M, m, S, s, "H"]
+	LDI		R19, 0xFF
+	OUT		GPIOR0, R19
+	RET
+
+ BlinkTimeLow:
+	// Time COMs: [X, H, h, M, m, S, s, "H"]
+	LDS		R18, SetTimeDate
+	SBRC	R18, SetTime_Hh
+	LDI		R19, 0x9F
+	SBRC	R18, SetTime_Mm
+	LDI		R19, 0xE7
+	SBRC	R18, SetTime_Ss
+	LDI		R19, 0xF9
+	OUT		GPIOR0, R19
+	RET
+
+ ;*****************************************************************************
+ DisplayDate_DdMm:
+	// Date COMs: [X, D, d, M, m, 2, 4, "F"]
+	LDI		R18, 0xFF				// COMs: 0b1111_1111
+	OUT		GPIOR0, R18
+	LDS		R18, NowCOMs
+	LDS		R19, PrevCOMs
+	CP		R18, R19
+	BREQ	NoDisplayTime_DdMm
+	STS		PrevCOMs, R18
+	SBRC	R18, COM0
+	LDI		R19, 11
+	SBRC	R18, COM1
+	LDI		R19, 4
+	SBRC	R18, COM2
+	LDI		R19, 2
+	SBRC	R18, COM3
+	LDS		R19, Time_MonthsU
+	SBRC	R18, COM4
+	LDS		R19, Time_MonthsT
+	SBRC	R18, COM5
+	LDS		R19, Time_DaysU
+	SBRC	R18, COM6
+	LDS		R19, Time_DaysT
+	OUT		GPIOR1, R19
+	CALL	MultiplexerBCD
+	RJMP	LOOP
+	NoDisplayTime_DdMm:
+	RJMP	LOOP
+
+ ;*****************************************************************************
+ ModifyDate_DdMm:
+	// Date COMs: [X, D, d, M, m, 2, 4, "F"]
+	LDI		R18, 0xFF				// COMs: 0b1111_1111
+	OUT		GPIOR0, R18
+	LDS		R18, NowCOMs
+	LDS		R19, PrevCOMs
+	CP		R18, R19
+	BREQ	NoModifyTime_DdMm
+	STS		PrevCOMs, R18
+	SBRC	R18, COM0
+	LDI		R19, 11
+	SBRC	R18, COM1
+	LDI		R19, 4
+	SBRC	R18, COM2
+	LDI		R19, 2
+	SBRC	R18, COM3
+	LDS		R19, Time_MonthsU
+	SBRC	R18, COM4
+	LDS		R19, Time_MonthsT
+	SBRC	R18, COM5
+	LDS		R19, Time_DaysU
+	SBRC	R18, COM6
+	LDS		R19, Time_DaysT
+	OUT		GPIOR1, R19
+
+	LDS		R18, IncTimeFlag
+	CPI		R18, 0
+	BRNE	NoBlinkDate
+
+	SBIC	PORTB, PB3
+	CALL	BlinkDateHigh
+	SBIS	PORTB, PB3
+	CALL	BlinkDateLow
+
+	NoBlinkDate:
+	CALL	MultiplexerBCD
+	RJMP	LOOP
+	NoModifyTime_DdMm:
+	RJMP	LOOP
+
+ BlinkDateLow:
+	// Date COMs: [X, D, d, M, m, 2, 4, "F"]
+	LDS		R18, SetTimeDate
+	SBRC	R18, SetDate_Dd
+	LDI		R19, 0x9F
+	SBRC	R18, SetDate_Mm
+	LDI		R19, 0xE7
+	OUT		GPIOR0, R19
+	RET
+
+ BlinkDateHigh:
+	// Date COMs: [X, D, d, M, m, 2, 4, "F"]
+	LDI		R19, 0xFF				// COMs: 0b1111_1111
+	OUT		GPIOR0, R19
+	RET
+
+ ;*****************************************************************************
+ DisplayAlarm_HhMm:
+	// Alarm COMs: [X, H, h, M, m, 0, 0, "A"]
+	LDI		R18, 0xFF				// COMs: 0b1111_1111
+	OUT		GPIOR0, R18
+	LDS		R18, NowCOMs
+	LDS		R19, PrevCOMs
+	CP		R18, R19
+	BREQ	NoDisplayAlarm_HhMm
+	STS		PrevCOMs, R18
+	SBRC	R18, COM0
+	LDI		R19, 12
+	SBRC	R18, COM1
+	LDI		R19, 0
+	SBRC	R18, COM2
+	LDI		R19, 0
+	SBRC	R18, COM3
+	LDS		R19, Alarm_MinutesU
+	SBRC	R18, COM4
+	LDS		R19, Alarm_MinutesT
+	SBRC	R18, COM5
+	LDS		R19, Alarm_HoursU
+	SBRC	R18, COM6
+	LDS		R19, Alarm_HoursT
+	OUT		GPIOR1, R19
+	CALL	MultiplexerBCD
+	RJMP	LOOP
+	NoDisplayAlarm_HhMm:
+	RJMP	LOOP
+
+ ;*****************************************************************************
+ ModifyAlarm_HhMm:
+	// Alarm COMs: [X, H, h, M, m, 0, 0, "A"]
+	LDI		R18, 0xFF				// COMs: 0b1111_1111
+	OUT		GPIOR0, R18
+	LDS		R18, NowCOMs
+	LDS		R19, PrevCOMs
+	CP		R18, R19
+	BREQ	NoModifyAlarm_HhMm
+	STS		PrevCOMs, R18
+	SBRC	R18, COM0
+	LDI		R19, 12
+	SBRC	R18, COM1
+	LDI		R19, 0
+	SBRC	R18, COM2
+	LDI		R19, 0
+	SBRC	R18, COM3
+	LDS		R19, Alarm_MinutesU
+	SBRC	R18, COM4
+	LDS		R19, Alarm_MinutesT
+	SBRC	R18, COM5
+	LDS		R19, Alarm_HoursU
+	SBRC	R18, COM6
+	LDS		R19, Alarm_HoursT
+	OUT		GPIOR1, R19
+
+	LDS		R18, IncAlarmFlag
+	CPI		R18, 0
+	BRNE	NoBlinkAlarm
+
+	SBIC	PORTB, PB3
+	CALL	BlinkAlarmHigh
+	SBIS	PORTB, PB3
+	CALL	BlinkAlarmLow
+
+	NoBlinkAlarm:
+	CALL	MultiplexerBCD
+	RJMP	LOOP
+	NoModifyAlarm_HhMm:
+	RJMP	LOOP
+
+ BlinkAlarmLow:
+	// Alarm COMs: [X, H, h, M, m, 0, 0, A]
+	LDS		R18, SetAlarm
+	SBRC	R18, SetAlarm_Mm
+	LDI		R19, 0xE7				// COMs: 0b1110_0111
+	SBRC	R18, SetAlarm_Hh
+	LDI		R19, 0x9F				// COMs: 0b1001_1111
+	OUT		GPIOR0, R19
+	RET
+
+ BlinkAlarmHigh:
+	// Alarm COMs: [X, H, h, M, m, 0, 0, A]
+	LDI		R19, 0xFF				// COMs: 0b1111_1111
+	OUT		GPIOR0, R19
+	RET
+
+ ;*****************************************************************************
+ MultiplexerBCD:
+	// Bring address of "0"
+	LDI		ZL, LOW(TABLA7SEG<<1)
+	IN		R18, GPIOR1			// Bring parameter digit to display
+	ADD		ZL, R18				// Calculate address of digit
+	LPM		R18, Z				// Obtain segments associated
+	OUT		PORTD, R18			// Display segments
+	LDS		R18, PrevCOMs
+
+	IN		R19, GPIOR0
+	AND		R18, R19
+
+	OUT		PORTC, R18
+	SBRC	R18, COM6
+	SBI		PORTB, PB5
+	SBRS	R18, COM6
+	CBI		PORTB, PB5
+	RET
+
+ ;*****************************************************************************
+ UpdateTime:
+	CLR		R18
+	STS		UpdateTimeFlag, R18
+	LDS		R18, VerifyAlarmFlag
+	SUBI	R18, 1
+	STS		VerifyAlarmFlag, R18
+	LDS		R18, Time_SecondsU
+	INC		R18
+	CPI		R18, 10				// Seconds limit condition
+	BREQ	IncTime_SecondsT
+	STS		Time_SecondsU, R18
+	RET
+
+	IncTime_SecondsT:
+	CLR		R18
+	STS		Time_SecondsU, R18
+	LDS		R18, Time_SecondsT
+	INC		R18
+	CPI		R18, 6				// Seconds limit condition
+	BREQ	IncTime_MinutesU
+	STS		Time_SecondsT, R18
+	RET
+
+	IncTime_MinutesU:
+	CLR		R18
+	STS		Time_SecondsT, R18
+	LDS		R18, Time_MinutesU
+	INC		R18
+	CPI		R18, 10				// Minutes limit condition
+	BREQ	IncTime_MinutesT
+	STS		Time_MinutesU, R18
+	RET
+
+	IncTime_MinutesT:
+	CLR		R18
+	STS		Time_MinutesU, R18
+	LDS		R18, Time_MinutesT
+	INC		R18
+	CPI		R18, 6				// Minutes limit condition
+	BREQ	IncTime_HoursU
+	STS		Time_MinutesT, R18
+	RET
+
+	IncTime_HoursU:
+	CLR		R18
+	STS		Time_MinutesT, R18
+	LDS		R18, Time_HoursU
+	INC		R18
+	CPI		R18, 4				// 24 hours limit condition
+	BREQ	EndDay
+	CPI		R18, 10				// Hours limit condition
+	BREQ	IncTime_HoursT
+	STS		Time_HoursU, R18
+	RET
+
+	EndDay:
+	LDS		R18, Time_HoursT
+	CPI		R18, 2				// Hours limit condition
+	BRNE	NotEndDay
+	CLR		R18
+	STS		Time_HoursU, R18
+	STS		Time_HoursT, R18
+	RJMP	IncTime_DaysU		// Here the change of days happens
+	NotEndDay:
+	LDI		R18, 4
+	STS		Time_HoursU, R18
+	RET
+
+	IncTime_HoursT:
+	CLR		R18
+	STS		Time_HoursU, R18
+	LDS		R18, Time_HoursT
+	INC		R18
+	STS		Time_HoursT, R18
+	RET
+
+	IncTime_DaysU:
+	LDS		R18, Time_MonthsT
+	CPI		R18, 0				// Days of each month first condition
+	BREQ	Jan_Sept
+	CPI		R18, 1
+	BREQ	Oct_Dec
+	RET
+
+	Jan_Sept:
+	LDS		R18, Time_MonthsU
+
+	CPI		R18, 1
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	Month_31
+
+	CPI		R18, 2
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	Month_28
+
+	CPI		R18, 3
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	Month_31
+
+	CPI		R18, 4
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	Month_30
+
+	CPI		R18, 5
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	Month_31
+
+	CPI		R18, 6
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	Month_30
+
+	CPI		R18, 7
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	Month_31
+
+	CPI		R18, 8
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	Month_31
+
+	CPI		R18, 9
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	Month_30
+	RET
+
+	Oct_Dec:
+	LDS		R18, Time_MonthsU
+
+	CPI		R18, 0
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	Month_31
+	
+	CPI		R18, 1
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	Month_30
+
+	CPI		R18, 2
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	Month_31
+	RET
+
+	Month_28:
+	LDS		R18, Time_DaysU
+	INC		R18
+	CPI		R18, 9
+	BREQ	EndMonth_28
+	CPI		R18, 10
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	IncTime_DaysT
+	STS		Time_DaysU, R18
+	RET
+	EndMonth_28:
+	LDS		R18, Time_DaysT
+	CPI		R18, 2
+	BRNE	NotEndMonth_28
+	LDI		R18, 1
+	STS		Time_DaysU, R18			// Time_DaysU cannot be 0 after end of month
+	CLR		R18
+	STS		Time_DaysT, R18
+	RJMP	IncTime_MonthsU			// Here the change of months happens
+	NotEndMonth_28:
+	LDI		R18, 9
+	STS		Time_DaysU, R18
+	RET
+
+	Month_30:
+	LDS		R18, Time_DaysU
+	INC		R18
+	CPI		R18, 1
+	BREQ	EndMonth_30
+	CPI		R18, 10
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	IncTime_DaysT
+	STS		Time_DaysU, R18
+	RET
+	EndMonth_30:
+	LDS		R18, Time_DaysT
+	CPI		R18, 3
+	BRNE	NotEndMonth_30
+	LDI		R18, 1
+	STS		Time_DaysU, R18			// Time_DaysU cannot be 0 after end of month
+	CLR		R18
+	STS		Time_DaysT, R18
+	RJMP	IncTime_MonthsU			// Here the change of months happens
+	NotEndMonth_30:
+	LDI		R18, 1
+	STS		Time_DaysU, R18
+	RET
+
+	Month_31:
+	LDS		R18, Time_DaysU
+	INC		R18
+	CPI		R18, 2
+	BREQ	EndMonth_31
+	CPI		R18, 10
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	IncTime_DaysT
+	STS		Time_DaysU, R18
+	RET
+	EndMonth_31:
+	LDS		R18, Time_DaysT
+	CPI		R18, 3
+	BRNE	NotEndMonth_31
+	LDI		R18, 1
+	STS		Time_DaysU, R18			// Time_DaysU cannot be 0 after end of month
+	CLR		R18
+	STS		Time_DaysT, R18
+	RJMP	IncTime_MonthsU			// Here the change of months happens
+	NotEndMonth_31:
+	LDI		R18, 2
+	STS		Time_DaysU, R18
+	RET
+
+	IncTime_DaysT:
+	CLR		R18
+	STS		Time_DaysU, R18
+	LDS		R18, Time_DaysT
+	INC		R18
+	STS		Time_DaysT, R18
+	RET
+
+	IncTime_MonthsU:
+	LDS		R18, Time_MonthsU
+	INC		R18
+	CPI		R18, 3				// 12 months limit condition
+	BREQ	EndYear
+	CPI		R18, 10				// Months limit condition
+	BREQ	IncTime_MonthsT
+	STS		Time_MonthsU, R18
+	RET
+
+	IncTime_MonthsT:
+	CLR		R18
+	STS		Time_MonthsU, R18
+	LDS		R18, Time_MonthsT
+	INC		R18
+	STS		Time_MonthsT, R18
+	RET
+
+	EndYear:
+	LDS		R18, Time_MonthsT
+	CPI		R18, 1
+	BRNE	NotEndYear
+	LDI		R18, 1
+	STS		Time_MonthsU, R18
+	CLR		R18
+	STS		Time_MonthsT, R18
+	RET						// Here the change of years happens
+	NotEndYear:
+	LDI		R18, 3
+	STS		Time_MonthsU, R18
+	RET
+
+ ;*****************************************************************************
+ VerifyAlarm:
+	CLR		R18
+	STS		VerifyAlarmFlag, R18
+
+	LDS		R18, AlarmEnableFlag
+	CPI		R18, 0
+	BREQ	AlarmDisabled
+
+	LDS		R18, Time_HoursT
+	LDS		R19, Alarm_HoursT
+	CPSE	R18, R19
+	RJMP	AlarmDisabled
+	LDS		R18, Time_HoursU
+	LDS		R19, Alarm_HoursU
+	CPSE	R18, R19
+	RJMP	AlarmDisabled
+	LDS		R18, Time_MinutesT
+	LDS		R19, Alarm_MinutesT
+	CPSE	R18, R19
+	RJMP	AlarmDisabled
+	LDS		R18, Time_MinutesU
+	LDS		R19, Alarm_MinutesU
+	CPSE	R18, R19
+	RJMP	AlarmDisabled
+
+	LDS		R18, AlarmDoneFlag
+	SUBI	R18, 1
+	STS		AlarmDoneFlag, R18
+	RET
+	AlarmDisabled:
+	CLR		R18
+	STS		AlarmDoneFlag, R18
+	CBI		PORTB, PB4
+	RET
+
+ ;*****************************************************************************
+ AlarmDone:
+	LDS		R18, PrevPins
+	SBRS	R18, ButtonA
+	RJMP	TurnOffAlarm	
+
+	SBIC	PORTB, PB3
+	SBI		PORTB, PB4
+	SBIS	PORTB, PB3
+	CBI		PORTB, PB4
+
+	RET
+
+	TurnOffAlarm:
+	CLR		R18
+	STS		AlarmEnableFlag, R18
+	STS		AlarmDoneFlag, R18
+	CBI		PORTB, PB4
+	RET
+
+ ;*****************************************************************************
+ IncrementAlarm:
+	// Identify the case
+	LDS		R18, IncAlarmFirst
+	CPI		R18, 0
+	BRNE	SingleIncAlarm
+	LDS		R18, IncAlarmLongDelay
+	CPI		R18, 0
+	BREQ	AlarmLongWait
+	LDS		R18, IncAlarmShortDelay
+	CPI		R18, 0
+	BRNE	SingleIncAlarm
+	RET
+	AlarmLongWait:
+	RET
+	SingleIncAlarm:
+	CLR		R18
+	STS		IncAlarmFirst, R18
+	STS		IncAlarmShortDelay, R18
+	LDS		R18, SetAlarm
+	SBRC	R18, SetAlarm_Mm
+	RJMP	IncrementAlarm_Mm
+	SBRC	R18, SetAlarm_Hh
+	RJMP	IncrementAlarm_Hh
+	RET
+
+	IncrementAlarm_Mm:
+	LDS		R18, Alarm_MinutesU
+	INC		R18
+	CPI		R18, 10				// Minutes limit condition
+	BREQ	IncAlarm_MinutesT
+	STS		Alarm_MinutesU, R18
+	RET
+	IncAlarm_MinutesT:
+	CLR		R18
+	STS		Alarm_MinutesU, R18
+	LDS		R18, Alarm_MinutesT
+	INC		R18
+	CPI		R18, 6				// Minutes limit condition
+	BREQ	RestartAlarm_MinutesT
+	STS		Alarm_MinutesT, R18
+	RET
+	RestartAlarm_MinutesT:
+	CLR		R18
+	STS		Alarm_MinutesT, R18
+	RET
+
+	IncrementAlarm_Hh:
+	LDS		R18, Alarm_HoursU
+	INC		R18
+	CPI		R18, 4				// 24 hours limit condition
+	BREQ	Alarm_EndDay
+	CPI		R18, 10				// Hours limit condition
+	BREQ	IncAlarm_HoursT
+	STS		Alarm_HoursU, R18
+	RET
+
+	Alarm_EndDay:
+	LDS		R18, Alarm_HoursT
+	CPI		R18, 2				// Hours limit condition
+	BRNE	Alarm_NotEndDay
+	CLR		R18
+	STS		Alarm_HoursU, R18
+	STS		Alarm_HoursT, R18
+	RET
+	Alarm_NotEndDay:
+	LDI		R18, 4
+	STS		Alarm_HoursU, R18
+	RET
+	IncAlarm_HoursT:
+	CLR		R18
+	STS		Alarm_HoursU, R18
+	LDS		R18, Alarm_HoursT
+	INC		R18
+	STS		Alarm_HoursT, R18
+	RET
+ ;*****************************************************************************
+ IncrementTime:
+	LDS		R18, IncTimeFirst
+	CPI		R18, 0
+	BRNE	SingleIncTime
+	LDS		R18, IncTimeLongDelay
+	CPI		R18, 0
+	BREQ	TimeLongWait
+	LDS		R18, IncTimeShortDelay
+	CPI		R18, 0
+	BRNE	SingleIncTime
+	RET
+	TimeLongWait:
+	RET
+	SingleIncTime:
+	CLR		R18
+	STS		IncTimeFirst, R18
+	STS		IncTimeShortDelay, R18
+	LDS		R18, SetTimeDate
+	SBRC	R18, SetTime_Ss
+	RJMP	IncrementTime_Ss
+	SBRC	R18, SetTime_Mm
+	RJMP	IncrementTime_Mm
+	SBRC	R18, SetTime_Hh
+	RJMP	IncrementTime_Hh
+	SBRC	R18, SetDate_Mm
+	RJMP	IncrementDate_Mm
+	SBRC	R18, SetDate_Dd
+	RJMP	IncrementDate_Dd
+	RET
+
+	IncrementTime_Ss:
+	CLR		R18
+	STS		Time_SecondsU, R18
+	STS		Time_SecondsT, R18
+	RET
+
+	IncrementTime_Mm:
+	LDS		R18, Time_MinutesU
+	INC		R18
+	CPI		R18, 10				// Minutes limit condition
+	BREQ	IncTime_Mm
+	STS		Time_MinutesU, R18
+	RET
+	IncTime_Mm:
+	CLR		R18
+	STS		Time_MinutesU, R18
+	LDS		R18, Time_MinutesT
+	INC		R18
+	CPI		R18, 6				// Minutes limit condition
+	BREQ	RestartTime_Mm
+	STS		Time_MinutesT, R18
+	RET
+	RestartTime_Mm:
+	CLR		R18
+	STS		Time_MinutesT, R18
+	RET
+
+	IncrementTime_Hh:
+	LDS		R18, Time_HoursU
+	INC		R18
+	CPI		R18, 4				// 24 hours limit condition
+	BREQ	IncTime_EndDay
+	CPI		R18, 10				// Hours limit condition
+	BREQ	IncTime_Hh
+	STS		Time_HoursU, R18
+	RET
+
+	IncTime_EndDay:
+	LDS		R18, Time_HoursT
+	CPI		R18, 2				// Hours limit condition
+	BRNE	IncTime_NotEndDay
+	CLR		R18
+	STS		Time_HoursU, R18
+	STS		Time_HoursT, R18
+	RET
+	IncTime_NotEndDay:
+	LDI		R18, 4
+	STS		Time_HoursU, R18
+	RET
+	IncTime_Hh:
+	CLR		R18
+	STS		Time_HoursU, R18
+	LDS		R18, Time_HoursT
+	INC		R18
+	STS		Time_HoursT, R18
+	RET
+
+	IncrementDate_Dd:
+	LDS		R18, Time_MonthsT
+	CPI		R18, 0				// Days of each month first condition
+	BREQ	IncDate_JanSept
+	CPI		R18, 1
+	BREQ	IncDate_OctDec
+	RET
+
+	IncDate_JanSept:
+	LDS		R18, Time_MonthsU
+
+	CPI		R18, 1
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	IncDate_Month31
+
+	CPI		R18, 2
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	IncDate_Month28
+
+	CPI		R18, 3
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	IncDate_Month31
+
+	CPI		R18, 4
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	IncDate_Month30
+
+	CPI		R18, 5
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	IncDate_Month31
+
+	CPI		R18, 6
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	IncDate_Month30
+
+	CPI		R18, 7
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	IncDate_Month31
+
+	CPI		R18, 8
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	IncDate_Month31
+
+	CPI		R18, 9
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	IncDate_Month30
+	RET
+
+	IncDate_OctDec:
+	LDS		R18, Time_MonthsU
+
+	CPI		R18, 0
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	IncDate_Month31
+	
+	CPI		R18, 1
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	IncDate_Month30
+
+	CPI		R18, 2
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	IncDate_Month31
+	RET
+
+	IncDate_Month28:
+	LDS		R18, Time_DaysU
+	INC		R18
+	CPI		R18, 9
+	BREQ	IncDate_EndMonth28
+	CPI		R18, 10
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	IncDate_Dd
+	STS		Time_DaysU, R18
+	RET
+	IncDate_EndMonth28:
+	LDS		R18, Time_DaysT
+	CPI		R18, 2
+	BRNE	IncDate_NotEndMonth28
+	LDI		R18, 1
+	STS		Time_DaysU, R18			// Time_DaysU cannot be 0 after end of month
+	CLR		R18
+	STS		Time_DaysT, R18
+	RET
+	IncDate_NotEndMonth28:
+	LDI		R18, 9
+	STS		Time_DaysU, R18
+	RET
+
+	IncDate_Month30:
+	LDS		R18, Time_DaysU
+	INC		R18
+	CPI		R18, 1
+	BREQ	IncDate_EndMonth30
+	CPI		R18, 10
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	IncDate_Dd
+	STS		Time_DaysU, R18
+	RET
+	IncDate_EndMonth30:
+	LDS		R18, Time_DaysT
+	CPI		R18, 3
+	BRNE	IncDate_NotEndMonth30
+	LDI		R18, 1
+	STS		Time_DaysU, R18			// Time_DaysU cannot be 0 after end of month
+	CLR		R18
+	STS		Time_DaysT, R18
+	RET
+	IncDate_NotEndMonth30:
+	LDI		R18, 1
+	STS		Time_DaysU, R18
+	RET
+
+	IncDate_Month31:
+	LDS		R18, Time_DaysU
+	INC		R18
+	CPI		R18, 2
+	BREQ	IncDate_EndMonth31
+	CPI		R18, 10
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	IncDate_Dd
+	STS		Time_DaysU, R18
+	RET
+	IncDate_EndMonth31:
+	LDS		R18, Time_DaysT
+	CPI		R18, 3
+	BRNE	IncDate_NotEndMonth31
+	LDI		R18, 1
+	STS		Time_DaysU, R18			// Time_DaysU cannot be 0 after end of month
+	CLR		R18
+	STS		Time_DaysT, R18
+	RET
+	IncDate_NotEndMonth31:
+	LDI		R18, 2
+	STS		Time_DaysU, R18
+	RET
+
+	IncDate_Dd:
+	CLR		R18
+	STS		Time_DaysU, R18
+	LDS		R18, Time_DaysT
+	INC		R18
+	STS		Time_DaysT, R18
+	RET
+
+	IncrementDate_Mm:
+	LDS		R18, Time_MonthsU
+	INC		R18
+	CPI		R18, 3				// 12 months limit condition
+	BREQ	IncDate_EndYear
+	CPI		R18, 10				// Months limit condition
+	BREQ	IncDate_Mm
+	STS		Time_MonthsU, R18
+	RET
+
+	IncDate_Mm:
+	CLR		R18
+	STS		Time_MonthsU, R18
+	LDS		R18, Time_MonthsT
+	INC		R18
+	STS		Time_MonthsT, R18
+	RET
+
+	IncDate_EndYear:
+	LDS		R18, Time_MonthsT
+	CPI		R18, 1
+	BRNE	IncDate_NotEndYear
+	LDI		R18, 1
+	STS		Time_MonthsU, R18
+	CLR		R18
+	STS		Time_MonthsT, R18
+	RET						// Here the change of years happens
+	IncDate_NotEndYear:
+	LDI		R18, 3
+	STS		Time_MonthsU, R18
+	RET
+
+ ;*****************************************************************************
+ OutputLogic:	// Is executed every time the state change
+	// Each state change which module enable and which flags enable
+	LDS		R18, NextState
+	STS		ActualState, R18
+	// State S0
+	CPI		R18, S0
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	OutputLogic_S0
+	// State S1
+	CPI		R18, S1
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	OutputLogic_S1
+	// State S2
+	CPI		R18, S2
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	OutputLogic_S2
+	// State S3
+	CPI		R18, S3
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	OutputLogic_S3
+	// State S4
+	CPI		R18, S4
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	OutputLogic_S4
+	// State S5
+	CPI		R18, S5
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	OutputLogic_S4
+	// State S6
+	CPI		R18, S6
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	OutputLogic_S6
+	// State S7
+	CPI		R18, S7
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	OutputLogic_S6
+	// State S8
+	CPI		R18, S8
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	OutputLogic_S0
+	// State S9
+	CPI		R18, S9
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	OutputLogic_S9
+	// State S10
+	CPI		R18, S10
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	OutputLogic_S4
+	// State S11
+	CPI		R18, S11
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	OutputLogic_S11
+	// State S12
+	CPI		R18, S12
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	OutputLogic_S12
+	// State S13
+	CPI		R18, S13
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	OutputLogic_S6
+	// State S14
+	CPI		R18, S14
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	OutputLogic_S14
+
+	CLR		R18
+	STS		Modules, R18
+	RET
+
+	OutputLogic_S0:
+	LDI		R18, (1<<DisplayHour)
+	STS		Modules, R18
+	RET
+	OutputLogic_S1:
+	LDI		R18, (1<<DisplayFecha)
+	STS		Modules, R18
+	RET
+	OutputLogic_S2:
+	LDI		R18, (1<<DisplayAlarm)
+	STS		Modules, R18
+	RET
+	OutputLogic_S3:
+	CBI		PORTB, PB4
+	LDI		R18, (1<<DisplayAlarm)
+	STS		Modules, R18
+	LDS		R18, AlarmEnableFlag
+	CPI		R18, 0
+	BREQ	EnableAlarm
+	CLR		R18
+	STS		AlarmEnableFlag, R18
+	RET
+	EnableAlarm:
+	LDS		R18, AlarmEnableFlag
+	SUBI	R18, 1
+	STS		AlarmEnableFlag, R18
+	RET
+	OutputLogic_S4:
+	CLR		R18
+	STS		IncAlarmFlag, R18
+	LDI		R18, (1<<ModifyAlarm)
+	STS		Modules, R18
+	RET
+	OutputLogic_S6:
+	CLR		R18
+	STS		IncTimeFlag, R18
+	RJMP	ModifyTimeCases
+	OutputLogic_S9:
+	LDS		R18, SetAlarm		// Bring timer order being set
+	ROL		R18					// Rotate
+	SBRC	R18, 2				// SetAlarm[0] = Mm (Minutes)
+	LDI		R18, 1				// SetAlarm[1] = Hh (Hours)
+	STS		SetAlarm, R18		// Save timer order being set
+	LDI		R18, (1<<ModifyAlarm)
+	STS		Modules, R18
+	RET
+	OutputLogic_S11:
+	LDS		R18, IncAlarmFlag
+	SUBI	R18, 1
+	STS		IncAlarmFlag, R18
+	LDS		R18, IncAlarmFirst
+	SUBI	R18, 1
+	STS		IncAlarmFirst, R18
+	CLR		R18
+	STS		IncAlarmLongDelay, R18
+	LDI		R18, (1<<ModifyAlarm)
+	STS		Modules, R18
+	RET
+	OutputLogic_S12:
+	LDS		R18, SetTimeDate
+	ROL		R18
+	SBRC	R18, 5
+	LDI		R18, 1
+	STS		SetTimeDate, R18
+	RJMP	ModifyTimeCases
+	OutputLogic_S14:
+	LDS		R18, IncTimeFlag
+	SUBI	R18, 1
+	STS		IncTimeFlag, R18
+	LDS		R18, IncTimeFirst
+	SUBI	R18, 1
+	STS		IncTimeFirst, R18
+	CLR		R18
+	STS		IncTimeLongDelay, R18
+	RJMP	ModifyTimeCases
+
+	ModifyTimeCases:
+	LDS		R18, SetTimeDate
+	SBRC	R18, SetTime_Ss
+	LDI		R19, (1<<ModifyHour)
+	SBRC	R18, SetTime_Mm
+	LDI		R19, (1<<ModifyHour)
+	SBRC	R18, SetTime_Hh
+	LDI		R19, (1<<ModifyHour)
+	SBRC	R18, SetDate_Mm
+	LDI		R19, (1<<ModifyFecha)
+	SBRC	R18, SetDate_Dd
+	LDI		R19, (1<<ModifyFecha)
+	STS		Modules, R19
+	RET
+ ;*****************************************************************************
+ NextStateLogic:
+	// Maybe change RJMP for CALL in transitions but return isn't needed
+	LDS		R18, NowPins
+	STS		PrevPins, R18
+	LDS		R18, ActualState
+	CPI		R18, S0
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	S0_Transitions		// Goto S0 inputs analysis
+	CPI		R18, S1
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	S1_Transitions		// Goto S1 inputs analysis
+	CPI		R18, S2
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	S2_Transitions		// Goto S2 inputs analysis
+	CPI		R18, S3
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	S3_Transitions		// Goto S3 inputs analysis
+	CPI		R18, S4
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	S4_Transitions		// Goto S4 inputs analysis
+	CPI		R18, S5
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	S5_Transitions		// Goto S5 inputs analysis
+	CPI		R18, S6
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	S6_Transitions		// Goto S6 inputs analysis
+	CPI		R18, S7
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	S7_Transitions		// Goto S7 inputs analysis
+	CPI		R18, S8
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	S8_Transitions		// Goto S8 inputs analysis
+	CPI		R18, S9
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	S9_Transitions		// Goto S9 inputs analysis
+	CPI		R18, S10
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	S10_Transitions		// Goto S10 inputs analysis
+	CPI		R18, S11
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	S11_Transitions		// Goto S11 inputs analysis
+	CPI		R18, S12
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	S12_Transitions		// Goto S12 inputs analysis
+	CPI		R18, S13
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	S13_Transitions		// Goto S13 inputs analysis
+	CPI		R18, S14
+	IN		R19, SREG
+	SBRC	R19, SREG_Z
+	RJMP	S14_Transitions		// Goto S14 inputs analysis
+	RET
+	
+ ;*****************************************************************************
+ S0_Transitions:
+	LDS		R19, PrevPins
+ 	SBRS	R19, ButtonC
+	LDI		R18, S4
+	SBRS	R19, ButtonL
+	LDI		R18, S2
+	SBRS	R19, ButtonA
+	LDI		R18, S1
+	STS		NextState, R18
+	RET
+
+ S1_Transitions:
+	LDS		R19, PrevPins
+	SBRS	R19, ButtonL
+	LDI		R18, S3
+	SBRC	R19, ButtonA
+	LDI		R18, S0
+	STS		NextState, R18
+	CPI		R18, S3
+	BREQ	S1_AlarmEnabled
+	RET
+	S1_AlarmEnabled:
+	SBI		PORTB, PB4
+	RET
+
+ S2_Transitions:
+	LDS		R19, PrevPins
+	SBRC	R19, ButtonL
+	LDI		R18, S0
+	SBRS	R19, ButtonA
+	LDI		R18, S3
+	STS		NextState, R18
+	CPI		R18, S3
+	BREQ	S2_AlarmEnabled
+	RET
+	S2_AlarmEnabled:
+	SBI		PORTB, PB4
+	RET
+
+ S3_Transitions:
+	LDS		R19, PrevPins
+	SBRC	R19, ButtonL
+	LDI		R18, S1
+	SBRC	R19, ButtonA
+	LDI		R18, S2
+	STS		NextState, R18
+	RET
+
+ S4_Transitions:
+	LDS		R19, PrevPins
+	SBRC	R19, ButtonC
+	LDI		R18, S5
+	SBRS	R19, ButtonL
+	LDI		R18, S9
+	SBRS	R19, ButtonA
+	LDI		R18, S11
+	STS		NextState, R18
+	RET
+
+ S5_Transitions:
+	LDS		R19, PrevPins
+	SBRS	R19, ButtonC
+	LDI		R18, S6
+	SBRS	R19, ButtonL
+	LDI		R18, S9
+	SBRS	R19, ButtonA
+	LDI		R18, S11
+	STS		NextState, R18
+	RET
+
+ S6_Transitions:
+	LDS		R19, PrevPins
+	SBRC	R19, ButtonC
+	LDI		R18, S7
+	SBRS	R19, ButtonL
+	LDI		R18, S12
+	SBRS	R19, ButtonA
+	LDI		R18, S14
+	STS		NextState, R18
+	RET
+
+ S7_Transitions:
+	LDS		R19, PrevPins
+	SBRS	R19, ButtonC
+	LDI		R18, S8
+	SBRS	R19, ButtonL
+	LDI		R18, S12
+	SBRS	R19, ButtonA
+	LDI		R18, S14
+	STS		NextState, R18
+	RET
+
+ S8_Transitions:
+	LDS		R19, PrevPins
+	SBRC	R19, ButtonC
+	LDI		R18, S0
+	SBRS	R19, ButtonL
+	LDI		R18, S2
+	SBRS	R19, ButtonA
+	LDI		R18, S1
+	STS		NextState, R18
+	RET
+
+ S9_Transitions:
+	LDS		R19, PrevPins
+	SBRC	R19, ButtonC
+	LDI		R18, S6
+	SBRC	R19, ButtonL
+	LDI		R18, S10
+	SBRS	R19, ButtonA
+	LDI		R18, S11
+	STS		NextState, R18
+	RET
+
+ S10_Transitions:
+	LDS		R19, PrevPins
+	SBRC	R19, ButtonC
+	LDI		R18, S6
+	SBRS	R19, ButtonL
+	LDI		R18, S9
+	SBRS	R19, ButtonA
+	LDI		R18, S11
+	STS		NextState, R18
+	RET
+
+ S11_Transitions:
+	LDS		R19, PrevPins
+	SBRS	R19, ButtonL
+	RJMP	ContinuousAlarm
+	SBRS	R19, ButtonA
+	RET
+	SBRS	R19, ButtonC
+	LDI		R18, S4
+	SBRC	R19, ButtonC
+	LDI		R18, S5
+	STS		NextState, R18
+	RET
+	ContinuousAlarm:
+	LDI		R18, S9
+	STS		NextState, R18
+	RET
+
+ S12_Transitions:
+	LDS		R19, PrevPins
+	SBRC	R19, ButtonC
+	LDI		R18, S8
+	SBRC	R19, ButtonL
+	LDI		R18, S13
+	SBRS	R19, ButtonA
+	LDI		R18, S14
+	STS		NextState, R18
+	RET
+
+ S13_Transitions:
+	LDS		R19, PrevPins
+	SBRC	R19, ButtonC
+	LDI		R18, S8
+	SBRS	R19, ButtonL
+	LDI		R18, S12
+	SBRS	R19, ButtonA
+	LDI		R18, S14
+	STS		NextState, R18
+	RET
+
+ S14_Transitions:
+	LDS		R19, PrevPins
+	SBRS	R19, ButtonL
+	RJMP	ContinuousTime
+	SBRS	R19, ButtonA	
+	RET
+	SBRS	R19, ButtonC
+	LDI		R18, S6
+	SBRC	R19, ButtonC
+	LDI		R18, S7
+	STS		NextState, R18
+	RET
+	ContinuousTime:
+	LDI		R18, S12
+	STS		NextState, R18
+	RET
+
+ ;*****************************************************************************
+ PINCHANGE_INT0:
+	IN		R16, SREG
+	PUSH	R16
+	IN		R16, PINB			// Read actual state of pins
+	STS		NowPins, R16		// PrevPins should be updated
+	POP		R16
+	OUT		SREG, R16
+	RETI
+
+ TIMER0_OVF:
+	IN		R16, SREG
+	PUSH	R16
+	LDI		R16, 134
+	OUT		TCNT0, R16			// Restart Timer0: count 100 us
+	LDS		R16, NowCOMs		// Bring cathode commons status
+	ROL		R16					// Rotate
+	SBRC	R16, 7
+	LDI		R16, 1
+	STS		NowCOMs, R16		// Save cathode commons status
+	INC		Steps1ms
+	MOV		R16, Steps1ms
+	CPI		R16, 100			// 1 ms * 100 times = 100 ms
+	BREQ	IncSteps100ms
+	POP		R16
+	OUT		SREG, R16
+	RETI
+	IncSteps100ms:
+	CLR		Steps1ms
+	LDS		R16, IncAlarmShortDelay
+	SUBI	R16, 1
+	STS		IncAlarmShortDelay, R16
+	LDS		R16, IncTimeShortDelay
+	SUBI	R16, 1
+	STS		IncTimeShortDelay, R16
+	INC		Steps100ms
+	MOV		R16, Steps100ms
+	CPI		R16, 5				// 100 ms * 5 times = 500 ms
+	BREQ	IncSteps500ms
+	POP		R16
+	OUT		SREG, R16
+	RETI
+	IncSteps500ms:
+	CLR		Steps100ms
+	SBI		PINB, PB3
+	INC		Steps500ms
+	MOV		R16, Steps500ms
+	CPI		R16, 2
+	BREQ	OneSecond
+	POP		R16
+	OUT		SREG, R16
+	RETI
+	OneSecond:
+	CLR		Steps500ms
+	LDS		R16, UpdateTimeFlag
+	SUBI	R16, 1
+	STS		UpdateTimeFlag, R16
+	LDS		R16, IncAlarmLongDelay
+	SUBI	R16, 1
+	STS		IncAlarmLongDelay, R16		// Need of independent clock
+	LDS		R16, IncTimeLongDelay
+	SUBI	R16, 1
+	STS		IncTimeLongDelay, R16		// Need of independent clock
+	POP		R16
+	OUT		SREG, R16
+	RETI
+
+ ;*****************************************************************************
